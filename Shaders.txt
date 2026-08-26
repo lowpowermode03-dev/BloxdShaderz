@@ -1,0 +1,675 @@
+// ==UserScript==
+// @name         Bloxd.io Shader Pack v3 — Bloom, God Rays, Reactive Day/Night (No UI)
+// @namespace    bloxd-shader-userscript
+// @version      3.0.0
+// @description  Real-time WebGL2 post-processing for Bloxd.io: multi-pass bloom, sun-tracked volumetric god rays, and screen-reactive day/night color grading. No on-screen panel — controlled entirely via keybinds and a console API (window.bloxdShader).
+// @author       you
+// @match        https://bloxd.io/*
+// @match        https://*.bloxd.io/*
+// @run-at       document-end
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @noframes
+// ==/UserScript==
+
+/*
+ * NO UI BY DESIGN.
+ * Everything is controlled through:
+ *   - Keybinds (see KEYBINDS below)
+ *   - The browser console, via the `bloxdShader` object this script exposes
+ *     on `window`, e.g.:
+ *       bloxdShader.get()                     -> current settings object
+ *       bloxdShader.set('bloomIntensity', 1)  -> change one value
+ *       bloxdShader.toggle()                  -> on/off
+ *       bloxdShader.preset('cinematic')       -> load a built-in preset
+ *       bloxdShader.reset()                   -> back to defaults
+ *   Settings persist across reloads via GM storage / localStorage.
+ *
+ * HONEST LIMITS:
+ * - Bloxd.io has no public API for hooking its renderer, sun position, or
+ *   settings menu. Day/night only exists inside specific gamemodes and is
+ *   implemented per-world via their World Code scripting system — there is
+ *   no single global variable this script can read.
+ * - So instead of faking a clock, this script *estimates* lighting purely
+ *   from the rendered pixels each frame: brightest screen point -> proxy
+ *   "sun" for god rays, average sky-region luminance/color -> day/night
+ *   grading. It reacts to whatever lighting Bloxd is actually showing.
+ * - This only affects the visual output layer (a canvas drawn on top). It
+ *   does not read/write game state, network traffic, or give any gameplay
+ *   advantage — it's cosmetic only.
+ */
+
+(function () {
+  'use strict';
+
+  /* ------------------------------------------------------------------ *
+   *  SETTINGS / PERSISTENCE
+   * ------------------------------------------------------------------ */
+
+  const DEFAULTS = {
+    enabled: true,
+    saturation: 1.15,
+    contrast: 1.08,
+    brightness: 1.03,
+    gamma: 1.0,
+    vignette: 0.28,
+    sharpen: 0.15,
+    bloomThreshold: 0.72,
+    bloomIntensity: 0.55,
+    godrayIntensity: 0.85,
+    godrayDecay: 0.94,
+    godraySamples: 32,
+    godrayExposure: 0.6,
+    dayNightStrength: 0.7,
+  };
+
+  const PRESETS = {
+    subtle: { saturation: 1.05, contrast: 1.03, bloomIntensity: 0.25, godrayIntensity: 0.35, dayNightStrength: 0.4, vignette: 0.15, sharpen: 0.08 },
+    cinematic: { saturation: 1.2, contrast: 1.15, bloomIntensity: 0.7, godrayIntensity: 1.1, dayNightStrength: 0.85, vignette: 0.35, sharpen: 0.18 },
+    vivid: { saturation: 1.35, contrast: 1.2, bloomIntensity: 0.9, godrayIntensity: 0.6, dayNightStrength: 0.6, vignette: 0.2, sharpen: 0.25 },
+    off: { enabled: false },
+  };
+
+  const hasGM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
+  const STORE_KEY = 'bloxdShaderSettingsV3';
+
+  function loadSettings() {
+    try {
+      const raw = hasGM ? GM_getValue(STORE_KEY, null) : localStorage.getItem(STORE_KEY);
+      if (!raw) return { ...DEFAULTS };
+      return { ...DEFAULTS, ...(typeof raw === 'string' ? JSON.parse(raw) : raw) };
+    } catch (e) {
+      return { ...DEFAULTS };
+    }
+  }
+  function saveSettings(s) {
+    const raw = JSON.stringify(s);
+    if (hasGM) GM_setValue(STORE_KEY, raw);
+    else localStorage.setItem(STORE_KEY, raw);
+  }
+
+  const settings = loadSettings();
+
+  /* ------------------------------------------------------------------ *
+   *  FIND THE GAME CANVAS
+   * ------------------------------------------------------------------ */
+
+  function findGameCanvas() {
+    const canvases = Array.from(document.querySelectorAll('canvas'));
+    let best = null, bestArea = 0;
+    for (const c of canvases) {
+      const area = c.clientWidth * c.clientHeight;
+      if (area > bestArea) { bestArea = area; best = c; }
+    }
+    return bestArea > 0 ? best : null;
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  SHADER SOURCES
+   * ------------------------------------------------------------------ */
+
+  const VERT_SRC = `#version 300 es
+  in vec2 aPos;
+  out vec2 vUv;
+  void main() {
+    vUv = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }`;
+
+  const FRAG_COPY = `#version 300 es
+  precision highp float;
+  in vec2 vUv;
+  out vec4 outColor;
+  uniform sampler2D uSrc;
+  uniform float uThreshold;
+  void main() {
+    vec3 c = texture(uSrc, vUv).rgb;
+    if (uThreshold >= 0.0) {
+      float b = max(max(c.r, c.g), c.b);
+      float w = smoothstep(uThreshold, uThreshold + 0.15, b);
+      c *= w;
+    }
+    outColor = vec4(c, 1.0);
+  }`;
+
+  const FRAG_BLUR = `#version 300 es
+  precision highp float;
+  in vec2 vUv;
+  out vec4 outColor;
+  uniform sampler2D uSrc;
+  uniform vec2 uDir;
+  void main() {
+    float w0=0.227027, w1=0.1945946, w2=0.1216216, w3=0.054054, w4=0.016216;
+    vec3 r = texture(uSrc, vUv).rgb * w0;
+    r += texture(uSrc, vUv + uDir).rgb * w1;
+    r += texture(uSrc, vUv - uDir).rgb * w1;
+    r += texture(uSrc, vUv + uDir*2.0).rgb * w2;
+    r += texture(uSrc, vUv - uDir*2.0).rgb * w2;
+    r += texture(uSrc, vUv + uDir*3.0).rgb * w3;
+    r += texture(uSrc, vUv - uDir*3.0).rgb * w3;
+    r += texture(uSrc, vUv + uDir*4.0).rgb * w4;
+    r += texture(uSrc, vUv - uDir*4.0).rgb * w4;
+    outColor = vec4(r, 1.0);
+  }`;
+
+  const FRAG_GODRAY = `#version 300 es
+  precision highp float;
+  in vec2 vUv;
+  out vec4 outColor;
+  uniform sampler2D uSrc;
+  uniform vec2 uSunPos;
+  uniform float uDecay;
+  uniform float uWeight;
+  uniform float uExposure;
+  uniform int uSamples;
+  uniform vec3 uTint;
+  void main() {
+    vec2 delta = (vUv - uSunPos) / float(uSamples) * uWeight;
+    vec2 uv = vUv;
+    float illum = 1.0;
+    vec3 accum = vec3(0.0);
+    for (int i = 0; i < 64; i++) {
+      if (i >= uSamples) break;
+      uv -= delta;
+      accum += texture(uSrc, uv).rgb * illum;
+      illum *= uDecay;
+    }
+    accum *= uExposure / float(uSamples);
+    outColor = vec4(accum * uTint, 1.0);
+  }`;
+
+  const FRAG_COMPOSITE = `#version 300 es
+  precision highp float;
+  in vec2 vUv;
+  out vec4 outColor;
+
+  uniform sampler2D uSrc;
+  uniform sampler2D uBloom;
+  uniform sampler2D uRays;
+  uniform vec2 uTexel;
+  uniform float uSaturation;
+  uniform float uContrast;
+  uniform float uBrightness;
+  uniform float uGamma;
+  uniform float uVignette;
+  uniform float uSharpen;
+  uniform float uBloomIntensity;
+  uniform float uGodrayIntensity;
+  uniform float uDayFactor;
+  uniform float uDayNightStrength;
+
+  vec3 sampleSrc(vec2 uv) { return texture(uSrc, uv).rgb; }
+
+  void main() {
+    vec3 color = sampleSrc(vUv);
+
+    vec3 blurTap =
+      sampleSrc(vUv + vec2(uTexel.x, 0.0)) +
+      sampleSrc(vUv - vec2(uTexel.x, 0.0)) +
+      sampleSrc(vUv + vec2(0.0, uTexel.y)) +
+      sampleSrc(vUv - vec2(0.0, uTexel.y));
+    blurTap *= 0.25;
+    color += (color - blurTap) * uSharpen;
+
+    color += texture(uBloom, vUv).rgb * uBloomIntensity;
+    color += texture(uRays, vUv).rgb * uGodrayIntensity;
+
+    color *= uBrightness;
+    color = (color - 0.5) * uContrast + 0.5;
+
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    color = mix(vec3(luma), color, uSaturation);
+
+    vec3 nightTint = vec3(0.55, 0.65, 1.05);
+    vec3 duskTint  = vec3(1.15, 0.85, 0.70);
+    vec3 dayTint   = vec3(1.0, 1.0, 1.0);
+    float duskiness = 1.0 - abs(uDayFactor * 2.0 - 1.0);
+    vec3 tint = mix(nightTint, dayTint, uDayFactor);
+    tint = mix(tint, duskTint, duskiness * 0.6);
+    tint = mix(vec3(1.0), tint, uDayNightStrength);
+    color *= tint;
+    float nightDark = mix(0.82, 1.0, uDayFactor);
+    color *= mix(1.0, nightDark, uDayNightStrength);
+
+    color = pow(clamp(color, 0.0, 1.0), vec3(1.0 / max(uGamma, 0.0001)));
+
+    vec2 d = vUv - 0.5;
+    float dist = length(d) * 1.4142135;
+    float vigAmt = uVignette * mix(1.0, 1.35, (1.0 - uDayFactor) * uDayNightStrength);
+    float vig = smoothstep(0.9, 0.35, dist * (1.0 + vigAmt));
+    color *= mix(1.0 - vigAmt, 1.0, vig);
+
+    outColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+  }`;
+
+  /* ------------------------------------------------------------------ *
+   *  GL HELPERS
+   * ------------------------------------------------------------------ */
+
+  function compileShader(gl, type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      console.error('[Bloxd Shader] shader compile error:', gl.getShaderInfoLog(sh));
+    }
+    return sh;
+  }
+
+  function linkProgram(gl, vsSrc, fsSrc) {
+    const vs = compileShader(gl, gl.VERTEX_SHADER, vsSrc);
+    const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      console.error('[Bloxd Shader] program link error:', gl.getProgramInfoLog(prog));
+    }
+    return prog;
+  }
+
+  function uniformLocs(gl, prog, names) {
+    const out = {};
+    for (const n of names) out[n] = gl.getUniformLocation(prog, n);
+    return out;
+  }
+
+  function createFBO(gl, w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fbo, tex, w, h };
+  }
+
+  function smoothstep(edge0, edge1, x) {
+    const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+    return t * t * (3 - 2 * t);
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  MAIN RENDERER
+   * ------------------------------------------------------------------ */
+
+  class ShaderOverlay {
+    constructor(sourceCanvas) {
+      this.source = sourceCanvas;
+      this.destroyed = false;
+      this.frameCount = 0;
+      this.detectInterval = 4;
+
+      this.sunPos = [0.5, 0.85];
+      this.skyLuma = 0.5;
+      this.skyColor = [1, 1, 1];
+      this.dayFactor = 0.5;
+
+      this.overlay = document.createElement('canvas');
+      this.overlay.id = 'bloxd-shader-overlay';
+      Object.assign(this.overlay.style, {
+        position: 'fixed', top: '0', left: '0',
+        zIndex: 2147483000, pointerEvents: 'none',
+      });
+      document.body.appendChild(this.overlay);
+
+      this.gl = this.overlay.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
+      if (!this.gl) {
+        console.warn('[Bloxd Shader] WebGL2 unavailable — shader disabled.');
+        return;
+      }
+
+      this._initGL();
+      this._syncSize();
+      this._resizeObserver = new ResizeObserver(() => this._syncSize());
+      this._resizeObserver.observe(this.source);
+      window.addEventListener('resize', () => this._syncSize());
+
+      this._loop();
+    }
+
+    _initGL() {
+      const gl = this.gl;
+
+      this.progCopy = linkProgram(gl, VERT_SRC, FRAG_COPY);
+      this.uCopy = uniformLocs(gl, this.progCopy, ['uSrc', 'uThreshold']);
+      this.aCopy = gl.getAttribLocation(this.progCopy, 'aPos');
+
+      this.progBlur = linkProgram(gl, VERT_SRC, FRAG_BLUR);
+      this.uBlur = uniformLocs(gl, this.progBlur, ['uSrc', 'uDir']);
+      this.aBlur = gl.getAttribLocation(this.progBlur, 'aPos');
+
+      this.progGodray = linkProgram(gl, VERT_SRC, FRAG_GODRAY);
+      this.uGodray = uniformLocs(gl, this.progGodray, ['uSrc', 'uSunPos', 'uDecay', 'uWeight', 'uExposure', 'uSamples', 'uTint']);
+      this.aGodray = gl.getAttribLocation(this.progGodray, 'aPos');
+
+      this.progComposite = linkProgram(gl, VERT_SRC, FRAG_COMPOSITE);
+      this.uComp = uniformLocs(gl, this.progComposite, [
+        'uSrc', 'uBloom', 'uRays', 'uTexel', 'uSaturation', 'uContrast', 'uBrightness',
+        'uGamma', 'uVignette', 'uSharpen', 'uBloomIntensity', 'uGodrayIntensity',
+        'uDayFactor', 'uDayNightStrength',
+      ]);
+      this.aComp = gl.getAttribLocation(this.progComposite, 'aPos');
+
+      const quad = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
+      this.quadBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+      this.texSrc = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, this.texSrc);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+      this.tinyFBO = createFBO(gl, 16, 9);
+    }
+
+    _bindQuad(gl, attribLoc) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
+      gl.enableVertexAttribArray(attribLoc);
+      gl.vertexAttribPointer(attribLoc, 2, gl.FLOAT, false, 0, 0);
+    }
+
+    _syncSize() {
+      const rect = this.source.getBoundingClientRect();
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.round(rect.width * dpr));
+      const h = Math.max(1, Math.round(rect.height * dpr));
+      if (this.overlay.width !== w || this.overlay.height !== h) {
+        this.overlay.width = w;
+        this.overlay.height = h;
+        this._buildWorkingFBOs(w, h);
+      }
+      Object.assign(this.overlay.style, {
+        top: rect.top + 'px', left: rect.left + 'px',
+        width: rect.width + 'px', height: rect.height + 'px',
+      });
+    }
+
+    _buildWorkingFBOs(w, h) {
+      const gl = this.gl;
+      const bw = Math.max(32, Math.floor(w * 0.25));
+      const bh = Math.max(18, Math.floor(h * 0.25));
+      this.bright = createFBO(gl, bw, bh);
+      this.blurA = createFBO(gl, bw, bh);
+      this.blurB = createFBO(gl, bw, bh);
+      const gw = Math.max(32, Math.floor(w * 0.35));
+      const gh = Math.max(18, Math.floor(h * 0.35));
+      this.rays = createFBO(gl, gw, gh);
+    }
+
+    setVisible(visible) {
+      this.overlay.style.display = visible ? 'block' : 'none';
+      this.source.style.visibility = visible ? 'hidden' : 'visible';
+    }
+
+    _loop() {
+      if (this.destroyed) return;
+      this._render();
+      this._raf = requestAnimationFrame(() => this._loop());
+    }
+
+    _detectLighting() {
+      const gl = this.gl;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.tinyFBO.fbo);
+      gl.viewport(0, 0, this.tinyFBO.w, this.tinyFBO.h);
+      gl.useProgram(this.progCopy);
+      this._bindQuad(gl, this.aCopy);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.texSrc);
+      gl.uniform1i(this.uCopy.uSrc, 0);
+      gl.uniform1f(this.uCopy.uThreshold, -1.0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      const w = this.tinyFBO.w, h = this.tinyFBO.h;
+      const pixels = new Uint8Array(w * h * 4);
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      let maxLuma = -1, maxX = 0, maxY = 0;
+      let sumLuma = 0, sumR = 0, sumG = 0, sumB = 0;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = (y * w + x) * 4;
+          const r = pixels[i] / 255, g = pixels[i + 1] / 255, b = pixels[i + 2] / 255;
+          const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+          sumLuma += luma; sumR += r; sumG += g; sumB += b;
+          if (luma > maxLuma) { maxLuma = luma; maxX = x; maxY = y; }
+        }
+      }
+      const n = w * h;
+      const avgLuma = sumLuma / n;
+      const u = (maxX + 0.5) / w;
+      const v = 1.0 - (maxY + 0.5) / h;
+
+      const s = 0.08;
+      this.sunPos[0] += (u - this.sunPos[0]) * s;
+      this.sunPos[1] += (v - this.sunPos[1]) * s;
+      this.skyLuma += (avgLuma - this.skyLuma) * s;
+      this.skyColor[0] += (sumR / n - this.skyColor[0]) * s;
+      this.skyColor[1] += (sumG / n - this.skyColor[1]) * s;
+      this.skyColor[2] += (sumB / n - this.skyColor[2]) * s;
+
+      const df = smoothstep(0.16, 0.55, this.skyLuma);
+      this.dayFactor += (df - this.dayFactor) * s;
+    }
+
+    _render() {
+      const gl = this.gl;
+      if (!gl || !this.source.width || !this.source.height || !this.bright) return;
+
+      gl.bindTexture(gl.TEXTURE_2D, this.texSrc);
+      try {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.source);
+      } catch (e) { return; }
+
+      this.frameCount++;
+      if (this.frameCount % this.detectInterval === 0) this._detectLighting();
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.bright.fbo);
+      gl.viewport(0, 0, this.bright.w, this.bright.h);
+      gl.useProgram(this.progCopy);
+      this._bindQuad(gl, this.aCopy);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.texSrc);
+      gl.uniform1i(this.uCopy.uSrc, 0);
+      gl.uniform1f(this.uCopy.uThreshold, settings.bloomThreshold);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      let readTex = this.bright.tex;
+      for (let i = 0; i < 2; i++) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.blurA.fbo);
+        gl.viewport(0, 0, this.blurA.w, this.blurA.h);
+        gl.useProgram(this.progBlur);
+        this._bindQuad(gl, this.aBlur);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, readTex);
+        gl.uniform1i(this.uBlur.uSrc, 0);
+        gl.uniform2f(this.uBlur.uDir, 1 / this.blurA.w, 0);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.blurB.fbo);
+        gl.viewport(0, 0, this.blurB.w, this.blurB.h);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.blurA.tex);
+        gl.uniform2f(this.uBlur.uDir, 0, 1 / this.blurB.h);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        readTex = this.blurB.tex;
+      }
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.rays.fbo);
+      gl.viewport(0, 0, this.rays.w, this.rays.h);
+      gl.useProgram(this.progGodray);
+      this._bindQuad(gl, this.aGodray);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.bright.tex);
+      gl.uniform1i(this.uGodray.uSrc, 0);
+      gl.uniform2f(this.uGodray.uSunPos, this.sunPos[0], this.sunPos[1]);
+      gl.uniform1f(this.uGodray.uDecay, settings.godrayDecay);
+      gl.uniform1f(this.uGodray.uWeight, 1.0);
+      gl.uniform1f(this.uGodray.uExposure, settings.godrayExposure);
+      gl.uniform1i(this.uGodray.uSamples, settings.godraySamples | 0);
+      const maxC = Math.max(this.skyColor[0], this.skyColor[1], this.skyColor[2], 0.001);
+      gl.uniform3f(this.uGodray.uTint, this.skyColor[0] / maxC, this.skyColor[1] / maxC, this.skyColor[2] / maxC);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, this.overlay.width, this.overlay.height);
+      gl.useProgram(this.progComposite);
+      this._bindQuad(gl, this.aComp);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.texSrc);
+      gl.uniform1i(this.uComp.uSrc, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.blurB.tex);
+      gl.uniform1i(this.uComp.uBloom, 1);
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, this.rays.tex);
+      gl.uniform1i(this.uComp.uRays, 2);
+
+      gl.uniform2f(this.uComp.uTexel, 1 / this.overlay.width, 1 / this.overlay.height);
+      gl.uniform1f(this.uComp.uSaturation, settings.saturation);
+      gl.uniform1f(this.uComp.uContrast, settings.contrast);
+      gl.uniform1f(this.uComp.uBrightness, settings.brightness);
+      gl.uniform1f(this.uComp.uGamma, settings.gamma);
+      gl.uniform1f(this.uComp.uVignette, settings.vignette);
+      gl.uniform1f(this.uComp.uSharpen, settings.sharpen);
+      gl.uniform1f(this.uComp.uBloomIntensity, settings.bloomIntensity);
+      gl.uniform1f(this.uComp.uGodrayIntensity, settings.godrayIntensity);
+      gl.uniform1f(this.uComp.uDayFactor, this.dayFactor);
+      gl.uniform1f(this.uComp.uDayNightStrength, settings.dayNightStrength);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    get timeOfDayLabel() {
+      const d = this.dayFactor;
+      if (d > 0.72) return 'Day';
+      if (d > 0.42) return 'Dawn/Dusk';
+      return 'Night';
+    }
+
+    destroy() {
+      this.destroyed = true;
+      if (this._raf) cancelAnimationFrame(this._raf);
+      if (this._resizeObserver) this._resizeObserver.disconnect();
+      this.overlay.remove();
+      this.source.style.visibility = 'visible';
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  BOOTSTRAP
+   * ------------------------------------------------------------------ */
+
+  let overlay = null;
+
+  function attach(canvas) {
+    if (overlay) overlay.destroy();
+    overlay = new ShaderOverlay(canvas);
+    overlay.setVisible(settings.enabled);
+  }
+
+  function watchForCanvas() {
+    const existing = findGameCanvas();
+    if (existing && existing !== (overlay && overlay.source)) attach(existing);
+  }
+
+  function refreshEnabled() {
+    if (overlay) overlay.setVisible(settings.enabled);
+  }
+
+  const domObserver = new MutationObserver(watchForCanvas);
+  domObserver.observe(document.body, { childList: true, subtree: true });
+  watchForCanvas();
+  setInterval(watchForCanvas, 2000);
+
+  /* ------------------------------------------------------------------ *
+   *  CONSOLE API (window.bloxdShader) — this is the entire "UI"
+   * ------------------------------------------------------------------ */
+
+  window.bloxdShader = {
+    get: () => ({ ...settings }),
+    set(key, value) {
+      if (!(key in DEFAULTS)) {
+        console.warn(`[Bloxd Shader] unknown setting "${key}". Valid keys:`, Object.keys(DEFAULTS));
+        return;
+      }
+      settings[key] = value;
+      saveSettings(settings);
+      refreshEnabled();
+      console.log(`[Bloxd Shader] ${key} = ${value}`);
+    },
+    toggle() {
+      settings.enabled = !settings.enabled;
+      saveSettings(settings);
+      refreshEnabled();
+      console.log(`[Bloxd Shader] ${settings.enabled ? 'enabled' : 'disabled'}`);
+    },
+    preset(name) {
+      if (!PRESETS[name]) {
+        console.warn(`[Bloxd Shader] unknown preset "${name}". Options:`, Object.keys(PRESETS));
+        return;
+      }
+      Object.assign(settings, PRESETS[name]);
+      saveSettings(settings);
+      refreshEnabled();
+      console.log(`[Bloxd Shader] preset "${name}" applied.`);
+    },
+    reset() {
+      Object.assign(settings, DEFAULTS);
+      saveSettings(settings);
+      refreshEnabled();
+      console.log('[Bloxd Shader] reset to defaults.');
+    },
+    status() {
+      console.log(`[Bloxd Shader] enabled=${settings.enabled}, light=${overlay ? overlay.timeOfDayLabel : 'n/a'}`);
+      return this.get();
+    },
+  };
+
+  /* ------------------------------------------------------------------ *
+   *  KEYBINDS (no panel — everything is invisible until pressed)
+   *    Alt+Shift+S  -> toggle shader on/off
+   *    Alt+Shift+1  -> preset: subtle
+   *    Alt+Shift+2  -> preset: cinematic
+   *    Alt+Shift+3  -> preset: vivid
+   *    Alt+Shift+0  -> reset to defaults
+   * ------------------------------------------------------------------ */
+
+  window.addEventListener('keydown', (e) => {
+    if (!e.altKey || !e.shiftKey) return;
+    switch (e.code) {
+      case 'KeyS':
+        e.preventDefault();
+        window.bloxdShader.toggle();
+        break;
+      case 'Digit1':
+        e.preventDefault();
+        window.bloxdShader.preset('subtle');
+        break;
+      case 'Digit2':
+        e.preventDefault();
+        window.bloxdShader.preset('cinematic');
+        break;
+      case 'Digit3':
+        e.preventDefault();
+        window.bloxdShader.preset('vivid');
+        break;
+      case 'Digit0':
+        e.preventDefault();
+        window.bloxdShader.reset();
+        break;
+    }
+  });
+
+  console.log('[Bloxd Shader v3] Loaded (no panel). Use window.bloxdShader in the console, or Alt+Shift+S/1/2/3/0.');
+})();
